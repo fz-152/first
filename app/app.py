@@ -60,35 +60,6 @@ SCAN_LOG_MAXSIZE = 500          # размер очереди на задачу
 SCAN_LOG_GC_SEC = 15 * 60       # TTL: принудительно чистить незакрытые очереди через 15 мин
 
 
-def _get_queue(job_id: str) -> queue.Queue:
-    """Возвращает (создавая при необходимости) очередь логов задачи."""
-    with SCAN_LOGS_LOCK:
-        q = SCAN_LOGS.get(job_id)
-        if q is None:
-            q = SCAN_LOGS[job_id] = queue.Queue(maxsize=SCAN_LOG_MAXSIZE)
-        return q
-
-
-def _push_event(job_id: str, etype: str, **data):
-    """Кладёт типизированное сообщение {"type": ..., "data": {...}} в очередь.
-
-    Никогда не блокирует worker: если очередь полна, выбрасываем самое старое
-    сообщение и повторяем попытку (сканирование важнее полного лога).
-    """
-    msg = json.dumps({"type": etype, "ts": datetime.now().strftime("%H:%M:%S"),
-                      "data": data}, ensure_ascii=False)
-    q = _get_queue(job_id)
-    while True:
-        try:
-            q.put_nowait(msg)
-            return
-        except queue.Full:
-            try:
-                q.get_nowait()
-            except queue.Empty:
-                pass
-
-
 class _QueueLogHandler(logging.Handler):
     """Мост engine.emit → SSE: каждое событие прогресса сканера (scan_event)
     превращается в сообщение типа info/pass/warning/error.
@@ -119,9 +90,13 @@ class _QueueLogHandler(logging.Handler):
 
 
 def cleanup_scan_logs():
-    """GC для SCAN_LOGS: удаляет «осиротевшие» очереди — задача завершена,
-    но терминатор не был прочитан клиентом (клиент отключился / не подключался),
-    либо истёк TTL. Вызывается из потоков-раздатчиков SSE и по finish-сигналу."""
+    """GC для SCAN_LOGS/SCAN_HISTORY: удаляет «осиротевшие» очереди — задача
+    завершена, но терминатор не был прочитан клиентом (клиент отключился /
+    не подключался), либо истёк TTL. Вызывается из потоков-раздатчиков SSE,
+    по finish-сигналу и при AJAX-опросе /api/jobs.
+
+    Буфер истории (SCAN_HISTORY) чистится одновременно с очередью, чтобы
+    словарь не рос бесконечно (ТЗ §4 «Очистка памяти»)."""
     now = time.time()
     with SCAN_LOGS_LOCK:
         stale = []
@@ -139,6 +114,7 @@ def cleanup_scan_logs():
                 stale.append(jid)
         for jid in stale:
             SCAN_LOGS.pop(jid, None)
+            SCAN_HISTORY.pop(jid, None)
     return stale
 
 
@@ -288,6 +264,7 @@ def clear_test_data():
     for k in mem_keys:
         del JOBS[k]
         SCAN_LOGS.pop(k, None)
+        SCAN_HISTORY.pop(k, None)
     flash(f"Тестовые данные удалены: сканов из БД — {deleted_db}, "
           f"задач из памяти — {len(mem_keys)}.", "ok")
     return redirect(request.referrer or url_for("dashboard"))
@@ -343,8 +320,16 @@ def start_scan():
             JOBS[job_id]["finished_dt"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             qh.close()
             # терминатор ОБЯЗАТЕЛЬНО (успех или ошибка): стрим отдаст event: end
-            # и завершится; очередь до читателя удалит GC cleanup_scan_logs()
-            _get_queue(job_id).put(None)
+            # и завершится; очередь до читателя удалит GC cleanup_scan_logs().
+            # put с таймаутом — если очередь полна и не читается клиентом,
+            # worker не должен зависать навсегда (антидедлок).
+            term_q = _get_queue(job_id)
+            try:
+                term_q.put(None, timeout=30)
+            except queue.Full:
+                with SCAN_LOGS_LOCK:      # никто не читал — удаляем сразу сами
+                    SCAN_LOGS.pop(job_id, None)
+                    SCAN_HISTORY.pop(job_id, None)
             cleanup_old_jobs()
 
     threading.Thread(target=worker, daemon=True).start()
@@ -357,14 +342,64 @@ def _last_scan_id(site: str) -> int | None:
 
 
 # --------------------------------------------------------------- SSE-стрим логов
+# Буфер всех сообщений задачи (для догоняющей подписки после reconnect/F5):
+# job_id -> список сериализованных сообщений (кроме терминатора). Ограничен
+# SCAN_LOG_MAXSIZE записей, живёт до GC (cleanup_scan_logs) — см. ТЗ §4.
+SCAN_HISTORY: dict[str, list] = {}
+
+
+def _get_queue(job_id: str) -> queue.Queue:
+    """Возвращает (создавая при необходимости) очередь логов задачи."""
+    with SCAN_LOGS_LOCK:
+        q = SCAN_LOGS.get(job_id)
+        if q is None:
+            q = SCAN_LOGS[job_id] = queue.Queue(maxsize=SCAN_LOG_MAXSIZE)
+        return q
+
+
+def _push_event(job_id: str, etype: str, **data):
+    """Кладёт типизированное сообщение {"type": ..., "ts": ..., "data": {...}}
+    в очередь live-доставки И в буфер истории задачи.
+
+    Буфер истории нужен для критерия «логи подхватываются автоматически»:
+    клиент, подключившийся к стриму позже начала скана (F5, обрыв связи),
+    получает уже накопленные сообщения до перехода к live-режиму.
+
+    Никогда не блокирует worker: если очередь полна, выбрасываем самое старое
+    сообщение и повторяем попытку (сканирование важнее полного лога).
+    """
+    msg = json.dumps({"type": etype, "ts": datetime.now().strftime("%H:%M:%S"),
+                      "data": data}, ensure_ascii=False)
+    q = _get_queue(job_id)
+    with SCAN_LOGS_LOCK:
+        hist = SCAN_HISTORY.setdefault(job_id, [])
+        hist.append(msg)
+        if len(hist) > SCAN_LOG_MAXSIZE * 2:
+            del hist[:len(hist) - SCAN_LOG_MAXSIZE]
+    while True:
+        try:
+            q.put_nowait(msg)
+            return
+        except queue.Full:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                pass
+
+
 @app.route("/api/scan/<job_id>/stream")
 @login_required
 def scan_stream(job_id):
     """Live-трансляция хода сканирования (Server-Sent Events).
 
-    text/event-stream; при простое — SSE-комментарий ping (разрывает таймауты
-    обратных прокси, напр. Nginx, не закрывая соединение); по терминатору None
-    — финальное событие `end` и корректное завершение генератора.
+    text/event-stream; при простое — служебный heartbeat (`: ping`, разрывающий
+    таймауты обратных прокси, напр. Nginx) ИЛИ event `keepalive` (полезная
+    нагрузка, сбрасывающая client-side watchdog на случай молчаливой потери
+    данных через буферизирующий прокси); по терминатору None — финальное
+    событие `end` и корректное завершение генератора.
+
+    Поддержка reconnect: новые клиенты сначала получают буфер уже накопленных
+    сообщений (history), затем переходят в live-режим без дублей.
     """
     if job_id not in JOBS:
         abort(404)
@@ -372,24 +407,66 @@ def scan_stream(job_id):
 
     def gen():
         yield "retry: 3000\n\n"           # автопереподключение клиента через 3 c
+        # --- догоняющая подписка: отдаём накопленный буфер истории ---
+        with SCAN_LOGS_LOCK:
+            backlog = list(SCAN_HISTORY.get(job_id, []))
+        for msg in backlog:
+            yield f"data: {msg}\n\n"
+        # буфер отправлен — live-режим начинается с чистого листа:
+        # всё, что worker успел положить в очередь за время отправки backlog,
+        # будет отдано ниже; дубли из backlog вычищаем сравнением.
+        sent = set(backlog)
+        finished = False
+        idle_pings = 0
         while True:
             try:
                 msg = q.get(timeout=15)   # ждём не дольше таймаута типичного прокси
             except queue.Empty:
-                yield ": ping\n\n"        # служебный комментарий SSE
+                idle_pings += 1
+                if idle_pings >= 2:
+                    # полезная нагрузка: гарантирует активность потока даже
+                    # если прокси съедает SSE-комментарии
+                    yield 'event: keepalive\ndata: {"type": "keepalive"}\n\n'
+                    idle_pings = 0
+                else:
+                    yield ": ping\n\n"    # служебный комментарий SSE
                 continue
             if msg is None:               # сигнал завершения от worker'а
+                status = (JOBS.get(job_id) or {}).get("status", "completed")
+                yield ('data: ' + json.dumps({"type": "finished", "ts":
+                        datetime.now().strftime("%H:%M:%S"),
+                        "data": {"status": status}}, ensure_ascii=False) + "\n\n")
                 yield 'event: end\ndata: {"type": "end"}\n\n'
+                finished = True
                 break
+            if msg in sent:               # уже отдали из backlog — не дублируем
+                continue
+            sent.add(msg)                 # защита от дублей при reconnect'е
             yield f"data: {msg}\n\n"
-        # поток дочитан до конца — очередь больше не нужна (антиутечка памяти)
+        # поток дочитан до конца — очередь больше не нужна (антиутечка памяти);
+        # буфер истории оставляем до GC, чтобы reconnect-клиент мог догнать лог
         with SCAN_LOGS_LOCK:
             SCAN_LOGS.pop(job_id, None)
+        if finished:
+            cleanup_scan_logs()
 
     return Response(gen(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache",
                              "X-Accel-Buffering": "no",   # Nginx: не буферизовать ответ
                              "Connection": "keep-alive"})
+
+
+@app.route("/api/scan/<job_id>/logs")
+@login_required
+def api_scan_logs(job_id):
+    """Все накопленные логи задачи (snapshot) — резервный канал на случай,
+    если EventSource не может восстановить соединение со стримом."""
+    with SCAN_LOGS_LOCK:
+        raw = list(SCAN_HISTORY.get(job_id, []))
+    logs = [json.loads(m) for m in raw]
+    job = JOBS.get(job_id) or {}
+    return jsonify({"job_id": job_id, "status": job.get("status"),
+                    "logs": logs})
 
 
 @app.route("/api/jobs")

@@ -60,7 +60,7 @@
   const logBox   = document.getElementById('scan-log-box');
   const logPre   = document.getElementById('scan-log');
   const logTgl   = document.getElementById('scan-log-toggle');
-  let es = null, currentJob = null, hideTimer = null;
+  let es = null, currentJob = null, hideTimer = null, lastMsgAt = Date.now();
 
   logTgl.addEventListener('click', () => {
     const hidden = logPre.style.display === 'none';
@@ -70,7 +70,8 @@
 
   // цветовая дифференциация по типу сообщения SSE
   const COLORS = {info:'#c8d3e0', pass:'#4caf7d', warning:'#e0b341',
-                  error:'#e05c5c', done:'#4caf7d', progress:'#5b9bd5'};
+                  error:'#e05c5c', done:'#4caf7d', progress:'#5b9bd5',
+                  finished:'#4caf7d'};
   function now() { return new Date().toTimeString().slice(0, 8); }
   function addLine(type, ts, text) {
     const span = document.createElement('span');
@@ -93,27 +94,70 @@
     }, 5000);
   }
 
+  function handleMessage(m) {
+    lastMsgAt = Date.now();                   // сброс client-side watchdog
+    const d = m.data || {};
+    if (m.type === 'keepalive') return;       // служебный heartbeat — не рендерим
+    if (m.type === 'finished') {              // терминальный сигнал от сервера
+      closeStream(d.status === 'failed' ? 'error' : 'done');
+      return;
+    }
+    const text = (d.icon ? d.icon + ' ' : '') + (d.message || m.type);
+    addLine(m.type, m.ts || now(), text);
+    if (m.type === 'done')  closeStream('done');
+    if (m.type === 'error') closeStream('error');
+  }
+
+  // резервный канал: если EventSource так и не смог восстановить соединение —
+  // подтягиваем накопленные логи одним snapshot-запросом
+  async function fetchLogsSnapshot(jobId) {
+    try {
+      const r = await fetch('/api/scan/' + encodeURIComponent(jobId) + '/logs',
+                            {credentials: 'same-origin'});
+      if (!r.ok) return false;
+      const j = await r.json();
+      for (const m of (j.logs || [])) handleMessage(m);
+      if (j.status === 'completed' || j.status === 'failed') {
+        closeStream(j.status === 'failed' ? 'error' : 'done');
+      }
+      return true;
+    } catch (e) { return false; }
+  }
+
   function openStream(jobId) {
     if (es && currentJob === jobId) return;   // уже подключены к этой задаче
     if (es) es.close();
     clearTimeout(hideTimer);
     currentJob = jobId;
-    logPre.innerHTML = '';
+    logPre.innerHTML = '';                    // backlog стрима сам догонит историю
     logBox.style.display = '';
     logPre.style.display = '';
     logTgl.textContent = '▲ Свернуть';
+    lastMsgAt = Date.now();
     es = new EventSource('/api/scan/' + encodeURIComponent(jobId) + '/stream',
                          {withCredentials: true});
     es.onmessage = (ev) => {
       let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
-      const d = m.data || {};
-      const text = (d.icon ? d.icon + ' ' : '') + (d.message || m.type);
-      addLine(m.type, m.ts || now(), text);
-      if (m.type === 'done')  closeStream('done');
-      if (m.type === 'error') closeStream('error');
+      handleMessage(m);
     };
     es.addEventListener('end', () => closeStream(null)); // терминатор worker'а
-    es.onerror = () => { /* обрыв — EventSource сам переподключится (retry: 3000) */ };
+    es.onerror = () => { /* обрыв — EventSource сам переподключится (retry: 3000),
+                            сервер при reconnect отдаст буфер истории */ };
+    // watchdog: нет ни сообщений, ни heartbeat > 30 c — соединение, вероятно,
+    // молча умерло за прокси; пересоздаём EventSource, а при повторном отказе
+    // переходим на snapshot-API
+    if (window.__scanWatchdog) clearInterval(window.__scanWatchdog);
+    window.__scanWatchdog = setInterval(() => {
+      if (!currentJob) return;
+      if (Date.now() - lastMsgAt < 30000) return;
+      if (es && es.readyState !== EventSource.CONNECTING) {
+        es.close(); es = null;                // принудительный reconnect
+        openStream(currentJob);
+      } else if (!es) {
+        fetchLogsSnapshot(currentJob);        // fallback на REST-snapshot
+      }
+      lastMsgAt = Date.now();
+    }, 10000);
   }
 
   function light(j) {
@@ -142,6 +186,7 @@
         'см. <a href="{{ url_for("history") }}">историю</a>.</td></tr>';
       // автоподключение SSE: как только AJAX-опрос нашёл running-задачу —
       // открываем поток; после F5 этот же механизм заново подписывается на стрим
+      // (сервер при подписке отдаёт буфер уже накопленных логов — ничего не теряется)
       if (runningId) openStream(runningId);
       else if (es) closeStream(null);   // задача ушла из активных — закрываем поток
     } catch (e) { /* сеть/сервер недоступны — тихо пропускаем цикл */ }
