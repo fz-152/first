@@ -39,14 +39,87 @@
      <td>{{ j.result or '' }}</td></tr>
   {% endfor %}
   </tbody></table>
+
+  {# ------- живой лог сканирования (SSE), скрыт до появления running-задачи -- #}
+  <div id="scan-log-box" style="margin-top:14px{% if not jobs.values()|map(attribute='status')|select('equalto','running')|list %};display:none{% endif %}">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <strong id="scan-log-title">Живой лог сканирования</strong>
+      <button type="button" class="btn small" id="scan-log-toggle"
+              title="Свернуть/развернуть блок логов">▲ Свернуть</button>
+    </div>
+    <pre id="scan-log" style="font-family:'Consolas','Menlo',monospace;background:#10151d;
+        color:#c8d3e0;padding:12px;border-radius:8px;height:320px;overflow-y:auto;
+        white-space:pre-wrap;font-size:13px;line-height:1.45;margin:8px 0 0"></pre>
+  </div>
+
   <p class="muted">Автообновление страницы отключено. Список активных задач опрашивается
-    каждые 10 секунд без перезагрузки; завершённые сканирования доступны в
+    каждые 10 секунд без перезагрузки; ход сканирования транслируется в реальном времени
+    через Server-Sent Events; завершённые сканирования доступны в
     <a href="{{ url_for('history') }}">Истории сканирований</a>.</p>
 </div>
 <script>
 (function () {
   const tbody = document.getElementById('jobs-tbody');
   if (!tbody) return;
+  const logBox   = document.getElementById('scan-log-box');
+  const logPre   = document.getElementById('scan-log');
+  const logTgl   = document.getElementById('scan-log-toggle');
+  let es = null, currentJob = null, hideTimer = null;
+
+  logTgl.addEventListener('click', () => {
+    const hidden = logPre.style.display === 'none';
+    logPre.style.display = hidden ? '' : 'none';
+    logTgl.textContent = hidden ? '▲ Свернуть' : '▼ Развернуть';
+  });
+
+  // цветовая дифференциация по типу сообщения SSE
+  const COLORS = {info:'#c8d3e0', pass:'#4caf7d', warning:'#e0b341',
+                  error:'#e05c5c', done:'#4caf7d', progress:'#5b9bd5'};
+  function now() { return new Date().toTimeString().slice(0, 8); }
+  function addLine(type, ts, text) {
+    const span = document.createElement('span');
+    span.style.color = COLORS[type] || COLORS.info;
+    span.textContent = `[${ts}] ${text}\n`;
+    logPre.appendChild(span);
+    logPre.scrollTop = logPre.scrollHeight;   // автоскролл вниз
+  }
+
+  function closeStream(finalType) {
+    if (es) { es.close(); es = null; }
+    if (finalType) addLine(finalType, now(), finalType === 'done'
+      ? '✅ Сканирование завершено — соединение SSE закрыто.'
+      : '❌ Сканирование завершилось ошибкой — соединение SSE закрыто.');
+    refresh();                                // статус в таблице → «завершено»
+    // сворачиваем блок логов через 5 с (можно развернуть кнопкой)
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(() => {
+      logBox.style.display = 'none'; currentJob = null;
+    }, 5000);
+  }
+
+  function openStream(jobId) {
+    if (es && currentJob === jobId) return;   // уже подключены к этой задаче
+    if (es) es.close();
+    clearTimeout(hideTimer);
+    currentJob = jobId;
+    logPre.innerHTML = '';
+    logBox.style.display = '';
+    logPre.style.display = '';
+    logTgl.textContent = '▲ Свернуть';
+    es = new EventSource('/api/scan/' + encodeURIComponent(jobId) + '/stream',
+                         {withCredentials: true});
+    es.onmessage = (ev) => {
+      let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+      const d = m.data || {};
+      const text = (d.icon ? d.icon + ' ' : '') + (d.message || m.type);
+      addLine(m.type, m.ts || now(), text);
+      if (m.type === 'done')  closeStream('done');
+      if (m.type === 'error') closeStream('error');
+    };
+    es.addEventListener('end', () => closeStream(null)); // терминатор worker'а
+    es.onerror = () => { /* обрыв — EventSource сам переподключится (retry: 3000) */ };
+  }
+
   function light(j) {
     if (j.status === 'completed') return '<span class="badge b-green">завершено</span>';
     if (j.status === 'failed')    return '<span class="badge b-red">ошибка</span>';
@@ -58,7 +131,9 @@
       if (!r.ok) return;
       const active = await r.json();
       let html = '';
+      let runningId = null;
       for (const [jid, j] of Object.entries(active)) {
+        if (j.status === 'running' && !runningId) runningId = jid;
         const res = j.scan_id
           ? '<a href="{{ url_for("scan_detail", scan_id=0).replace("/0", "/") }}' + j.scan_id +
             '">отчёт #' + j.scan_id + (j.index != null ? ' (' + j.index + '%)' : '') + '</a>'
@@ -69,10 +144,19 @@
       tbody.innerHTML = html ||
         '<tr><td colspan="4">Активных задач нет — все сканирования завершены, ' +
         'см. <a href="{{ url_for("history") }}">историю</a>.</td></tr>';
+      // автоподключение SSE: как только AJAX-опрос нашёл running-задачу —
+      // открываем поток; после F5 этот же механизм заново подписывается на стрим
+      if (runningId) openStream(runningId);
+      else if (es) closeStream(null);   // задача ушла из активных — закрываем поток
     } catch (e) { /* сеть/сервер недоступны — тихо пропускаем цикл */ }
   }
+  window.refreshJobs = refresh;               // внешний вызов при необходимости
   setInterval(refresh, 10000);           // AJAX-опрос без перезагрузки страницы
   document.getElementById('refresh-jobs').addEventListener('click', refresh);
+  // первичная подписка на серверном рендере — не ждём первого AJAX-цикла
+  {% set ns = namespace(job_id=none) %}
+  {%- for jid, j in jobs.items() if j.status == 'running' and ns.job_id is none %}{% set ns.job_id = jid %}{% endfor -%}
+  {%- if ns.job_id %}openStream('{{ ns.job_id }}');{% endif %}
 })();
 </script>
 {% endif %}
