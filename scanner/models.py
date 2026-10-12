@@ -210,6 +210,17 @@ class Store:
         q += " ORDER BY id DESC"
         return [dict(r) for r in self._con.execute(q, args)]
 
+    def delete_scans(self, ids: list[int]) -> int:
+        """Удаляет сканирования (и связанные нарушения каскадом). Возвращает число."""
+        if not ids:
+            return 0
+        marks = ",".join("?" * len(ids))
+        n = self._con.execute(
+            f"DELETE FROM violations WHERE scan_id IN ({marks})", ids).rowcount
+        self._con.execute(f"DELETE FROM scans WHERE id IN ({marks})", ids)
+        self._con.commit()
+        return len(ids)
+
     def get_scan(self, scan_id: int) -> dict | None:
         r = self._con.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone()
         return dict(r) if r else None
