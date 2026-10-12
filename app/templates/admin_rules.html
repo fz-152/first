@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Админ-панель: чек-листы (нормативная база)</h1>
+<p class="muted">Правила можно включать/выключать, менять уровень критичности и редакцию нормы —
+без перезапуска сканера (ТЗ §2).</p>
+{% for block, rules in by_block.items() %}
+<div class="card">
+  <h2>{{ block }}</h2>
+  <table>
+   <tr><th>ID</th><th>Проверка</th><th>Основание (редакция закона)</th><th>Уровень</th><th>Включено</th><th></th></tr>
+   {% for r in rules %}
+   <form method="post" action="{{ url_for('admin_rule_update', rule_id=r.id) }}">
+   <tr>
+     <td>{{ r.id }}</td>
+     <td>{{ r.title }}<br><span class="muted">{{ r.description }}</span></td>
+     <td><input type="text" name="law" value="{{ r.law }}" style="min-width:240px"></td>
+     <td><select name="severity">
+       <option value="critical" {{'selected' if r.severity=='critical'}}>критично</option>
+       <option value="major" {{'selected' if r.severity=='major'}}>существенно</option>
+       <option value="minor" {{'selected' if r.severity=='minor'}}>незначительно</option></select></td>
+     <td><input type="checkbox" name="enabled" {{'checked' if r.enabled}}></td>
+     <td><button class="btn small" type="submit">Сохранить</button></td>
+   </tr>
+   </form>
+   {% endfor %}
+  </table>
+</div>
+{% endfor %}
+{% endblock %}

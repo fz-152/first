@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Карточка нарушения №{{ v.id }} <span class="muted">({{ v.rule_id }})</span></h1>
+<div class="card">
+  <table>
+    <tr><th>Проверка</th><td>{{ v.title }}</td></tr>
+    <tr><th>Блок</th><td>{{ v.block }}</td></tr>
+    <tr><th>Уровень</th><td class="sev-{{ v.severity }}">{{ {'critical':'КРИТИЧНО','major':'СУЩЕСТВЕННО','minor':'незначительно'}[v.severity] }}</td></tr>
+    <tr><th>Описание</th><td>{{ v.message }}</td></tr>
+    <tr><th>URL страницы</th><td><a href="{{ v.page_url }}" target="_blank" rel="noopener">{{ v.page_url }}</a></td></tr>
+    <tr><th>Ссылка на пункт закона</th><td>{{ v.law }}{% if rule %}<br><span class="muted">{{ rule.description }}</span>{% endif %}</td></tr>
+    {% if v.screenshot %}<tr><th>Скриншот зоны</th><td><img src="/{{ v.screenshot }}" style="max-width:640px;border:1px solid #ccc"></td></tr>{% endif %}
+  </table>
+  {% if v.details %}
+  <h2 style="margin-top:14px">Детали</h2>
+  <ul>{% for d in v.details %}<li style="word-break:break-all"><code>{{ d[0] }}</code> — {{ d[1] }}</li>{% endfor %}</ul>
+  {% endif %}
+</div>
+
+{% if current_user().role in ('admin','auditor') %}
+<div class="card">
+  <h2>Тикет — назначение ответственного и срока</h2>
+  <form method="post" action="{{ url_for('update_ticket', vid=v.id) }}">
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px">
+      <label>Статус<select name="status">
+        <option value="">— не менять —</option>
+        <option value="open" {{'selected' if v.status=='open'}}>Открыт</option>
+        <option value="in_progress" {{'selected' if v.status=='in_progress'}}>В работе</option>
+        <option value="resolved" {{'selected' if v.status=='resolved'}}>Устранено</option>
+        <option value="ignored" {{'selected' if v.status=='ignored'}}>Ложное срабатывание</option>
+      </select></label>
+      <label>Ответственный<input type="text" name="assignee" value="{{ v.assignee }}" placeholder="Иванов И.И."></label>
+      <label>Срок устранения<input type="date" name="due_date" value="{{ v.due_date }}"></label>
+      <div style="display:flex;align-items:end"><button class="btn" type="submit">Сохранить</button></div>
+    </div>
+    <p><label>Комментарий<textarea name="comment" rows="2">{{ v.comment }}</textarea></label></p>
+  </form>
+</div>
+{% endif %}
+<a class="btn" href="{{ url_for('scan_detail', scan_id=v.scan_id) }}">← К отчёту</a>
+{% endblock %}
