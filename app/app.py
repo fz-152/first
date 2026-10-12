@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import ipaddress
 import logging
 import queue
 import threading
@@ -13,6 +14,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from flask import (Flask, render_template, request, redirect, url_for, session,
                    flash, abort, send_file, jsonify, Response)
@@ -28,6 +30,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 EXPORT_DIR = BASE_DIR / "data" / "exports"
 
 app = Flask(__name__)
+# Флаг для интеграционных тестов/локальной разработки: разрешает запуск сканов
+# по localhost-адресам (в production-режиме start_scan их отклоняет).
+app.config["ALLOW_TEST_SCANS"] = False
 app.secret_key = (BASE_DIR / "data" / "secret_key").read_bytes() if (BASE_DIR / "data" / "secret_key").exists() \
     else None
 if app.secret_key is None:
@@ -154,15 +159,47 @@ def cleanup_old_jobs():
 
 
 def _active_jobs() -> dict:
-    """Только активные задачи (pending/running) — для дашборда."""
+    """Только активые задачи (pending/running), без тестовых адресов — для дашборда."""
     return {k: v for k, v in JOBS.items()
-            if v.get("status") in ("pending", "running")}
+            if v.get("status") in ("pending", "running")
+            and not is_test_site(v.get("site", ""))}
+
+
+# ----------------------------------------------------- фильтр тестовых адресов
+_LOCAL_HOST_PREFIXES = ("http://127.0.0.1", "https://127.0.0.1",
+                        "http://localhost", "https://localhost",
+                        "http://0.0.0.0", "https://0.0.0.0",
+                        "http://[::1]", "https://[::1]")
+
+
+def is_test_site(url: str) -> bool:
+    """True, если URL указывает на локальный/тестовый стенд.
+
+    Скрывает из UI артефакты разработки: localhost/127.0.0.1/0.0.0.0
+    и адреса из приватных диапазонов RFC1918 (10.x, 192.168.x, 172.16-31.x).
+    """
+    u = (url or "").lower().strip()
+    if any(u.startswith(p) for p in _LOCAL_HOST_PREFIXES):
+        return True
+    try:
+        host = urlsplit(u if "//" in u else "//" + u).hostname or ""
+    except ValueError:
+        return False
+    # localhost может встретиться и без схемы / с портом (host:port уже разобран)
+    if host == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_link_local or ip.is_private
 
 
 def _completed_jobs_sorted() -> list:
-    """Завершённые задачи (completed/failed), новые сверху — для истории."""
+    """Завершённые задачи (completed/failed), без тестовых адресов, новые сверху."""
     completed = [(k, v) for k, v in JOBS.items()
-                 if v.get("status") in ("completed", "failed")]
+                 if v.get("status") in ("completed", "failed")
+                 and not is_test_site(v.get("site", ""))]
     return sorted(completed, key=lambda item: item[1].get("finished_at", 0),
                   reverse=True)
 
@@ -202,6 +239,9 @@ def dashboard():
     scans = store.list_scans()
     sites = {}
     for s in scans:
+        # артефакты разработки (localhost/127.x/приватные сети) не показываем
+        if is_test_site(s["site"]):
+            continue
         sites.setdefault(s["site"], []).append(s)
     history = {site: list(reversed(h[:12])) for site, h in sites.items()}
 
@@ -237,6 +277,22 @@ def history_clear():
     return redirect(url_for("history"))
 
 
+@app.route("/admin/clear-test-data", methods=["POST"])
+@role_required("admin")
+def clear_test_data():
+    """Вариант В: удаляет из хранилища и памяти все сканирования тестовых
+    адресов (localhost/127.x/0.0.0.0/приватные сети). Только админ."""
+    db_ids = [s["id"] for s in store.list_scans() if is_test_site(s["site"])]
+    deleted_db = store.delete_scans(db_ids)
+    mem_keys = [k for k, v in JOBS.items() if is_test_site(v.get("site", ""))]
+    for k in mem_keys:
+        del JOBS[k]
+        SCAN_LOGS.pop(k, None)
+    flash(f"Тестовые данные удалены: сканов из БД — {deleted_db}, "
+          f"задач из памяти — {len(mem_keys)}.", "ok")
+    return redirect(request.referrer or url_for("dashboard"))
+
+
 # ------------------------------------------------------------------ запуск скана
 @app.route("/scan", methods=["POST"])
 @role_required("admin", "auditor")
@@ -244,6 +300,11 @@ def start_scan():
     site = request.form.get("site", "").strip()
     if not site.startswith(("http://", "https://")):
         site = "https://" + site
+    # валидация: тестовые/локальные адреса не должны попадать в хранилище (ТЗ, чек-лист п.4)
+    if is_test_site(site) and not app.config.get("ALLOW_TEST_SCANS"):
+        flash("Сканирование локальных/тестовых адресов (localhost, 127.x.x.x, "
+              "приватные сети) запрещено в production-режиме.", "error")
+        return redirect(url_for("dashboard"))
     job_id = uuid.uuid4().hex[:8]
     try:
         max_pages = int(request.form.get("max_pages", 1000))
