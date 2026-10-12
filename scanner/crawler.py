@@ -48,7 +48,8 @@ class CrawlStats:
 class Crawler:
     def __init__(self, root_url: str, *, max_pages: int = 1000, max_depth: int = 6,
                  timeout: int = 12, delay: float | None = None, user_agent: str = DEFAULT_UA,
-                 respect_robots: bool = True, deadline_sec: float = 15 * 60):
+                 respect_robots: bool = True, deadline_sec: float = 15 * 60,
+                 on_event=None):
         self.root = root_url if urlparse(root_url).path not in ("", "/") else root_url.rstrip("/") + "/"
         self.max_pages = max_pages
         self.max_depth = max_depth
@@ -56,6 +57,9 @@ class Crawler:
         self.delay = delay                    # None → из robots.txt / 0.35 c
         self.respect_robots = respect_robots
         self.deadline = deadline_sec
+        # callback(ev: dict) для живого лога прогресса (ТЗ §4.2 «в реальном времени»);
+        # ev = {"icon": "ℹ|✓|⚠|✗", "message": str, "ts": float}
+        self.on_event = on_event
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": user_agent,
@@ -67,6 +71,14 @@ class Crawler:
         self.pages: dict[str, Page] = {}      # url -> Page
         self.assets: dict[str, tuple[int, str]] = {}   # url документа -> (status, content-type)
         self.sitemaps: list[str] = []
+
+    def _event(self, message: str, icon: str = "ℹ") -> None:
+        """Оповещение наблюдателя прогресса (если зарегистрирован)."""
+        if self.on_event is not None:
+            try:
+                self.on_event({"icon": icon, "message": message, "ts": time.time()})
+            except Exception:                       # лог не должен ронять обход
+                log.debug("on_event завершился с ошибкой", exc_info=True)
 
     # ---------------------------------------------------------------- robots
     def _load_robots(self) -> None:
@@ -90,6 +102,10 @@ class Crawler:
                         self.sitemaps.append(line.split(":", 1)[1].strip())
         except requests.RequestException:
             log.info("robots.txt недоступен — работаем без него")
+            self._event("robots.txt недоступен — обход без ограничений robots", "ℹ")
+        else:
+            if self._rp is not None:
+                self._event("robots.txt загружен (Crawl-delay и запреты соблюдаются)", "ℹ")
 
     def allowed(self, url: str) -> bool:
         if not self.respect_robots or self._rp is None:
@@ -137,13 +153,16 @@ class Crawler:
         queue.appendleft((self.root, 0))
 
         seen: set[str] = {normalize_url(self.root, self.root) or self.root.rstrip("/")}
+        last_progress = 0.0
         while queue:
             if self.stats.fetched >= self.max_pages:
                 self.stats.truncated = True
+                self._event(f"Достигнут лимит в {self.max_pages} страниц — обход остановлен", "⚠")
                 break
             if time.monotonic() - start > self.deadline:
                 log.warning("Достигнут лимит времени сканирования (%.0f мин)", self.deadline / 60)
                 self.stats.truncated = True
+                self._event(f"Достигнут таймаут {self.deadline / 60:.0f} мин — обход остановлен", "⚠")
                 break
             url, depth = queue.popleft()
             if depth > self.max_depth or not self.allowed(url):
@@ -151,9 +170,17 @@ class Crawler:
                 continue
             page = self._crawl_page(url, depth)
             if page is None:
+                self._event(f"Не удалось загрузить страницу {url}", "✗")
                 continue
             self.pages[url] = page
             self.stats.fetched += 1
+            if depth == 0:
+                self._event(f"Главная страница загружена (HTTP {page.status})", "✓")
+            # прогресс — не чаще раза в секунду (чтобы не раздувать лог на больших сайтах)
+            now = time.time()
+            if now - last_progress >= 1.0:
+                last_progress = now
+                self._event(f"Прогресс: {self.stats.fetched}/{self.max_pages} страниц", "ℹ")
             if depth < self.max_depth:
                 for href in extract_links(page.html, url):
                     n = normalize_url(url, href)
@@ -161,6 +188,10 @@ class Crawler:
                         seen.add(n)
                         queue.append((n, depth + 1))
         self.stats.duration = time.monotonic() - start
+        self._event(
+            f"Обход завершён: {self.stats.fetched} стр. за {self.stats.duration:.1f} c"
+            + (f", ошибок загрузки: {self.stats.errors}" if self.stats.errors else ""),
+            "ℹ")
         return self.stats
 
     def _crawl_page(self, url: str, depth: int) -> Page | None:
@@ -177,6 +208,7 @@ class Crawler:
         page.html = r.text
         if self._looks_like_captcha(r.text):
             self.stats.blocked_events.append(url)
+            self._event(f"Признаки CAPTCHA/WAF на {url} — страница пропущена", "⚠")
         soup = BeautifulSoup(r.text, "lxml")
         title = soup.title.get_text(strip=True) if soup.title else ""
         page.title = title
@@ -203,6 +235,7 @@ class Crawler:
     # --------------------------------------------------- проверка документов
     def check_assets(self, urls: set[str]) -> dict[str, tuple[int, str]]:
         """HEAD-проверка ссылок на документы/внешние системы (ТЗ §3.1 «Ссылки»)."""
+        checked = broken = 0
         for u in list(urls)[:200]:
             if u in self.assets:
                 continue
@@ -215,6 +248,14 @@ class Crawler:
                     self.assets[u] = (g.status_code, g.headers.get("Content-Type", "")) if g else (0, "")
                 else:
                     self.assets[u] = (r.status_code, r.headers.get("Content-Type", ""))
+            checked += 1
+            st = self.assets[u][0]
+            if st and st >= 400 or st == 0:
+                broken += 1
+                self._event(f"Ссылка недоступна (HTTP {st or 'нет ответа'}): {u}", "✗")
+        if checked:
+            self._event(f"Проверено ссылок на документы/ИС: {checked}, "
+                        f"нерабочих: {broken}", "⚠" if broken else "✓")
         return self.assets
 
 
