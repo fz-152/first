@@ -4,7 +4,7 @@ from __future__ import annotations
 import secrets
 from functools import wraps
 
-from flask import abort, session, redirect, url_for, flash
+from flask import abort, session, redirect, request, url_for, flash
 
 from scanner.models import Store
 
@@ -25,7 +25,10 @@ def login_required(f):
     @wraps(f)
     def wrapper(*a, **kw):
         if not current_user():
-            return redirect(url_for("login", next=url_for(f.endpoint, **f.defaults or {})))
+            # request.endpoint надёжно даёт имя текущего маршрута,
+            # request.view_args — актуальные параметры из URL (f.defaults их мог пропустить)
+            return redirect(url_for("login",
+                                    next=url_for(request.endpoint, **request.view_args)))
         return f(*a, **kw)
     return wrapper
 
