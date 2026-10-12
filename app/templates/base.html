@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Сканер соответствия сайтов ОО{% endblock %}</title>
+<style>
+:root{--blue:#23477f;--bg:#f4f6fa;--red:#d33;--yellow:#e9a200;--green:#2e8b57;}
+*{box-sizing:border-box}
+body{margin:0;font-family:"Segoe UI",Arial,sans-serif;background:var(--bg);color:#222;font-size:15px}
+header{background:var(--blue);color:#fff;padding:10px 22px;display:flex;align-items:center;gap:22px}
+header .logo{font-weight:700;font-size:17px}
+header a{color:#dbe6ff;text-decoration:none}
+header a:hover{color:#fff}
+nav{display:flex;gap:16px;flex:1}
+.userbox{margin-left:auto;font-size:13px;color:#cfd9ee}
+main{max-width:1150px;margin:22px auto;padding:0 16px}
+.card{background:#fff;border-radius:10px;box-shadow:0 1px 4px rgba(0,0,0,.08);padding:18px 22px;margin-bottom:18px}
+h1{font-size:21px;margin:0 0 12px} h2{font-size:16px;margin:0 0 10px;color:var(--blue)}
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+th{background:#e8eef8;text-align:left;padding:7px 9px;border:1px solid #ccd6e6}
+td{padding:7px 9px;border:1px solid #dde3ee;vertical-align:top}
+.badge{display:inline-block;padding:2px 9px;border-radius:12px;font-size:12px;color:#fff;font-weight:600}
+.b-red{background:var(--red)}.b-yellow{background:var(--yellow)}.b-green{background:var(--green)}
+.b-gray{background:#8a93a5}
+.sev-critical{color:var(--red);font-weight:700}.sev-major{color:var(--yellow);font-weight:600}.sev-minor{color:#666}
+input[type=text],input[type=password],input[type=date],select,textarea{padding:7px 9px;border:1px solid #b9c2d3;border-radius:6px;font:inherit;width:100%}
+.btn{display:inline-block;background:var(--blue);color:#fff;border:0;border-radius:6px;padding:8px 16px;font:inherit;cursor:pointer;text-decoration:none}
+.btn:hover{filter:brightness(1.15)} .btn.small{padding:4px 10px;font-size:12.5px}
+.flash{padding:9px 14px;border-radius:6px;margin-bottom:12px}
+.flash.ok{background:#e2f3e8;color:#1d6b3c}.flash.error{background:#fbe4e4;color:#a12}
+.gauge{font-size:34px;font-weight:800}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:16px}
+details summary{cursor:pointer;color:var(--blue)}
+code{background:#eef1f7;padding:1px 5px;border-radius:4px;font-size:12.5px}
+.muted{color:#777;font-size:12.5px}
+footer{text-align:center;color:#8a93a5;font-size:12px;margin:30px 0 12px}
+</style>
+</head>
+<body>
+<header>
+  <span class="logo">🏛 Сканер соответствия сайтов колледжей РФ/СПб</span>
+  {% if current_user() %}
+  <nav>
+    <a href="{{ url_for('dashboard') }}">Дашборд</a>
+    {% if current_user().role in ('admin','auditor') %}<a href="#scanform">Сканирование</a>{% endif %}
+    {% if current_user().role == 'admin' %}<a href="{{ url_for('admin_rules') }}">Чек-листы</a>
+    <a href="{{ url_for('admin_users') }}">Пользователи</a>{% endif %}
+  </nav>
+  <span class="userbox">{{ current_user().login }} · {{ ROLE_LABELS[current_user().role] }} ·
+    <a href="{{ url_for('logout') }}">выход</a></span>
+  {% endif %}
+</header>
+<main>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for cat, m in messages %}<div class="flash {{cat}}">{{ m }}</div>{% endfor %}
+  {% endwith %}
+  {% block content %}{% endblock %}
+</main>
+<footer>EduCompliance Scanner v1.0 · нормативная база: Приказ Рособрнадзора № 1493, ПП РФ № 1802,
+419-ФЗ, ГОСТ Р 52872-2019, 152-ФЗ, ФКЗ № 2-ФКЗ, Закон СПб № 165-23, 149-ФЗ, 63-ФЗ, 5307-I</footer>
+</body></html>

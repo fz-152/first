@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Отчёт #{{ scan.id }} — {{ scan.site }}</h1>
+<div class="card">
+  <div style="display:flex;gap:22px;align-items:center;flex-wrap:wrap">
+    <span class="gauge" style="color:var(--{{ 'red' if light=='red' else ('yellow' if light=='yellow' else 'green') }})">
+      {{ scan.compliance_index }}%</span>
+    <span class="badge b-{{ 'red' if light=='red' else ('yellow' if light=='yellow' else 'green') }}">
+      {{ {'red':'ВЫСОКИЙ РИСК','yellow':'СРЕДНИЙ РИСК','green':'НИЗКИЙ РИСК'}[light] }}</span>
+    <div class="muted">
+      Страниц: {{ scan.pages_scanned }} · Время: {{ '%.1f'|format(scan.duration_sec) }} c<br>
+      Начало: {{ scan.started_at }} · Нарушений открыто: {{ open_cnt }}, устранено: {{ resolved_cnt }}
+    </div>
+    <div style="margin-left:auto;display:flex;gap:8px">
+      <a class="btn small" href="{{ url_for('export', scan_id=scan.id, fmt='pdf') }}">Скачать PDF</a>
+      <a class="btn small" href="{{ url_for('export', scan_id=scan.id, fmt='xlsx') }}">Скачать Excel</a>
+    </div>
+  </div>
+  {% if scan.notes %}<p class="muted">{{ scan.notes }}</p>{% endif %}
+</div>
+
+{% for block in blocks %}
+  {% set vs = grouped.get(block, []) %}
+  {% if vs %}
+  <div class="card">
+    <h2>{{ block }} <span class="muted">({{ vs|length }} нарушений)</span></h2>
+    <table>
+      <tr><th>Правило</th><th>Нарушение</th><th>URL страницы</th><th>Основание</th><th>Уровень</th><th>Тикет</th></tr>
+      {% for v in vs %}
+      <tr>
+        <td><a href="{{ url_for('violation_card', vid=v.id) }}">{{ v.rule_id }}</a></td>
+        <td>{{ v.title }}<br><span class="muted">{{ v.message }}</span></td>
+        <td style="max-width:260px;word-break:break-all">{{ v.page_url }}</td>
+        <td>{{ v.law }}</td>
+        <td class="sev-{{ v.severity }}">{{ {'critical':'КРИТИЧНО','major':'СУЩЕСТВЕННО','minor':'незначительно'}[v.severity] }}</td>
+        <td><span class="badge {{ {'open':'b-gray','in_progress':'b-yellow','resolved':'b-green','ignored':'b-gray'}[v.status] }}">{{
+            {'open':'открыт','in_progress':'в работе','resolved':'устранено','ignored':'ложное срабатыв.'}[v.status] }}</span>
+            {% if v.assignee %}<br><span class="muted">{{ v.assignee }} до {{ v.due_date }}</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+  {% endif %}
+{% endfor %}
+
+{% if not grouped %}<div class="card"><p>✅ Нарушений не обнаружено — сайт соответствует включённым пунктам чек-листа.</p></div>{% endif %}
+<a class="btn" href="{{ url_for('dashboard') }}">← Дашборд</a>
+{% endblock %}

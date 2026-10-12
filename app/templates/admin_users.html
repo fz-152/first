@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Пользователи и права доступа (ТЗ §5 «Безопасность»)</h1>
+<div class="card">
+<table><tr><th>Логин</th><th>Роль</th></tr>
+{% for u in users %}<tr><td>{{ u.login }}</td><td>{{ ROLE_LABELS[u.role] }}</td></tr>{% endfor %}</table>
+</div>
+<div class="card">
+ <h2>Добавить / изменить пользователя</h2>
+ <form method="post" style="display:flex;gap:10px;flex-wrap:wrap;align-items:end">
+  <label>Логин<input type="text" name="login" required></label>
+  <label>Пароль<input type="text" name="password" required></label>
+  <label>Роль<select name="role">
+    <option value="user">Пользователь (просмотр)</option>
+    <option value="auditor">Аудитор (скан+тикеты)</option>
+    <option value="admin">Администратор</option></select></label>
+  <button class="btn" type="submit">Сохранить</button>
+ </form>
+</div>
+{% endblock %}

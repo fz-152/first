@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Дашборд — мониторинг сайтов образовательных организаций</h1>
+
+<div class="grid">
+{% for site, scans in sites.items() %}
+  {% set last = scans[0] %}
+  <div class="card">
+    <h2><a href="{{ url_for('scan_detail', scan_id=last.id) }}">{{ site }}</a></h2>
+    <div style="display:flex;align-items:center;gap:14px">
+      <span class="gauge" style="color:var(--{{ 'red' if traffic_light(last.compliance_index)=='red' else ('yellow' if traffic_light(last.compliance_index)=='yellow' else 'green') }})">
+        {{ last.compliance_index }}%</span>
+      <span class="badge b-{{ 'red' if traffic_light(last.compliance_index)=='red' else ('yellow' if traffic_light(last.compliance_index)=='yellow' else 'green') }}">
+        {{ {'red':'КРАСНЫЙ','yellow':'ЖЁЛТЫЙ','green':'ЗЕЛЁНЫЙ'}[traffic_light(last.compliance_index)] }}</span>
+    </div>
+    <p class="muted">Сканирований: {{ scans|length }} · страниц: {{ last.pages_scanned }} ·
+      критичных: {{ last.red_count }}, существенных: {{ last.yellow_count }}</p>
+    {%- if scans|length > 1 %}
+    <p class="muted">Динамика индекса:
+      {%- for s in scans|reverse %} {{ s.compliance_index }}%{%- if not loop.last %} →{% endif %}{% endfor -%}
+    </p>
+    {%- endif %}
+    <a class="btn small" href="{{ url_for('scan_detail', scan_id=last.id) }}">Открыть отчёт</a>
+  </div>
+{% else %}
+  <div class="card"><p>История сканирований пуста. Запустите первое сканирование ниже.</p></div>
+{% endfor %}
+</div>
+
+{% if jobs %}
+<div class="card" id="jobs">
+  <h2>Текущие задачи</h2>
+  <table><tr><th>ID</th><th>Сайт</th><th>Статус</th><th>Результат</th></tr>
+  {% for jid, j in jobs.items() %}
+   <tr><td>{{ jid }}</td><td>{{ j.site }}</td>
+     <td>{% if j.status=='running' %}<span class="badge b-yellow">сканирование…</span>
+         {% elif j.status=='done' %}<span class="badge b-green">завершено</span>
+         {% else %}<span class="badge b-red">ошибка</span>{% endif %}</td>
+     <td>{% if j.scan_id %}<a href="{{ url_for('scan_detail', scan_id=j.scan_id) }}">отчёт #{{ j.scan_id }} ({{ j.index }}%)</a>
+         {% else %}{{ j.result or '' }}{% endif %}</td></tr>
+  {% endfor %}</table>
+  <p class="muted">Страница обновится автоматически.</p>
+</div>
+<script>setTimeout(()=>location.reload(), 5000);</script>
+{% endif %}
+
+{% if current_user().role in ('admin','auditor') %}
+<div class="card" id="scanform">
+  <h2>Запустить сканирование сайта</h2>
+  <form method="post" action="{{ url_for('start_scan') }}" style="display:flex;gap:10px;flex-wrap:wrap;align-items:end">
+    <label style="flex:2;min-width:260px">URL сайта колледжа
+      <input type="text" name="site" placeholder="https://college.example.ru" required></label>
+    <label style="flex:1;min-width:130px">Макс. страниц
+      <input type="text" name="max_pages" value="1000"></label>
+    <button class="btn" type="submit">Сканировать</button>
+  </form>
+  <p class="muted">Ограничения безопасности: polite-crawl (Crawl-delay из robots.txt), лимит 15 минут
+    и 1000 страниц на сайт (НФТ §5).</p>
+</div>
+{% endif %}
+{% endblock %}
