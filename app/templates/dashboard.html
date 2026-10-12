@@ -29,19 +29,52 @@
 
 {% if jobs %}
 <div class="card" id="jobs">
-  <h2>Текущие задачи</h2>
-  <table><tr><th>ID</th><th>Сайт</th><th>Статус</th><th>Результат</th></tr>
+  <h2>Текущие задачи <button type="button" class="btn small" id="refresh-jobs"
+        title="Обновить список активных задач без перезагрузки страницы">⟳ Обновить</button></h2>
+  <table><thead><tr><th>ID</th><th>Сайт</th><th>Статус</th><th>Результат</th></tr></thead>
+  <tbody id="jobs-tbody">
   {% for jid, j in jobs.items() %}
    <tr><td>{{ jid }}</td><td>{{ j.site }}</td>
-     <td>{% if j.status=='running' %}<span class="badge b-yellow">сканирование…</span>
-         {% elif j.status=='done' %}<span class="badge b-green">завершено</span>
-         {% else %}<span class="badge b-red">ошибка</span>{% endif %}</td>
-     <td>{% if j.scan_id %}<a href="{{ url_for('scan_detail', scan_id=j.scan_id) }}">отчёт #{{ j.scan_id }} ({{ j.index }}%)</a>
-         {% else %}{{ j.result or '' }}{% endif %}</td></tr>
-  {% endfor %}</table>
-  <p class="muted">Страница обновится автоматически.</p>
+     <td><span class="badge b-yellow">сканирование…</span></td>
+     <td>{{ j.result or '' }}</td></tr>
+  {% endfor %}
+  </tbody></table>
+  <p class="muted">Автообновление страницы отключено. Список активных задач опрашивается
+    каждые 10 секунд без перезагрузки; завершённые сканирования доступны в
+    <a href="{{ url_for('history') }}">Истории сканирований</a>.</p>
 </div>
-<script>setTimeout(()=>location.reload(), 5000);</script>
+<script>
+(function () {
+  const tbody = document.getElementById('jobs-tbody');
+  if (!tbody) return;
+  function light(j) {
+    if (j.status === 'completed') return '<span class="badge b-green">завершено</span>';
+    if (j.status === 'failed')    return '<span class="badge b-red">ошибка</span>';
+    return '<span class="badge b-yellow">сканирование…</span>';
+  }
+  async function refresh() {
+    try {
+      const r = await fetch('{{ url_for("api_jobs") }}', {credentials: 'same-origin'});
+      if (!r.ok) return;
+      const active = await r.json();
+      let html = '';
+      for (const [jid, j] of Object.entries(active)) {
+        const res = j.scan_id
+          ? '<a href="{{ url_for("scan_detail", scan_id=0).replace("/0", "/") }}' + j.scan_id +
+            '">отчёт #' + j.scan_id + (j.index != null ? ' (' + j.index + '%)' : '') + '</a>'
+          : (j.result || '');
+        html += '<tr><td>' + jid + '</td><td>' + j.site + '</td><td>' +
+                light(j) + '</td><td>' + res + '</td></tr>';
+      }
+      tbody.innerHTML = html ||
+        '<tr><td colspan="4">Активных задач нет — все сканирования завершены, ' +
+        'см. <a href="{{ url_for("history") }}">историю</a>.</td></tr>';
+    } catch (e) { /* сеть/сервер недоступны — тихо пропускаем цикл */ }
+  }
+  setInterval(refresh, 10000);           // AJAX-опрос без перезагрузки страницы
+  document.getElementById('refresh-jobs').addEventListener('click', refresh);
+})();
+</script>
 {% endif %}
 
 {% if current_user().role in ('admin','auditor') %}

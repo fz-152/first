@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from flask import (Flask, render_template, request, redirect, url_for, session,
@@ -37,6 +39,39 @@ DEFAULT_PW = init_default_users(store)
 # реестр запущенных сканирований (память процесса)
 JOBS: dict[str, dict] = {}
 
+# время хранения завершённых задач в JOBS (НФТ: очистка от «мусора» памяти)
+JOB_RETENTION_SEC = 86400  # 24 часа
+
+
+def cleanup_old_jobs():
+    """Удаляет из JOBS завершённые/упавшие задачи старше JOB_RETENTION_SEC."""
+    current_time = time.time()
+    keys_to_delete = []
+
+    for key, job in list(JOBS.items()):
+        if job.get("status") in ("completed", "failed"):
+            finished_at = job.get("finished_at", 0)
+            if current_time - finished_at > JOB_RETENTION_SEC:
+                keys_to_delete.append(key)
+
+    for key in keys_to_delete:
+        del JOBS[key]
+    return keys_to_delete
+
+
+def _active_jobs() -> dict:
+    """Только активные задачи (pending/running) — для дашборда."""
+    return {k: v for k, v in JOBS.items()
+            if v.get("status") in ("pending", "running")}
+
+
+def _completed_jobs_sorted() -> list:
+    """Завершённые задачи (completed/failed), новые сверху — для истории."""
+    completed = [(k, v) for k, v in JOBS.items()
+                 if v.get("status") in ("completed", "failed")]
+    return sorted(completed, key=lambda item: item[1].get("finished_at", 0),
+                  reverse=True)
+
 
 @app.context_processor
 def inject():
@@ -64,14 +99,48 @@ def logout():
 
 # ------------------------------------------------------------------ дашборд
 @app.route("/")
+@app.route("/dashboard")
 @login_required
 def dashboard():
+    # очистка старых завершённых задач при каждом открытии дашборда
+    cleanup_old_jobs()
+
     scans = store.list_scans()
     sites = {}
     for s in scans:
         sites.setdefault(s["site"], []).append(s)
     history = {site: list(reversed(h[:12])) for site, h in sites.items()}
-    return render_template("dashboard.html", sites=history, jobs=JOBS)
+
+    # на дашборде — только активные задачи (pending/running);
+    # завершённые ушли на страницу /history
+    active_jobs = _active_jobs()
+    return render_template("dashboard.html", sites=history, jobs=active_jobs)
+
+
+# ------------------------------------------------------------------ история сканирований (JOBS)
+@app.route("/history")
+@login_required
+def history():
+    """Страница завершённых задач текущего процесса (после очистки — пустая).
+
+    Полная постоянная история сканирований хранится в БД и доступна
+    на дашборде и по ссылкам /scan/<id>.
+    """
+    cleanup_old_jobs()
+    sorted_jobs = _completed_jobs_sorted()
+    return render_template("history.html", jobs=sorted_jobs)
+
+
+@app.route("/history/clear", methods=["POST"])
+@role_required("admin")
+def history_clear():
+    """Полная ручная очистка реестра JOBS от завершённых задач (админ)."""
+    removed = [k for k, v in JOBS.items()
+               if v.get("status") in ("completed", "failed")]
+    for k in removed:
+        del JOBS[k]
+    flash(f"Удалено завершённых задач из памяти: {len(removed)}", "ok")
+    return redirect(url_for("history"))
 
 
 # ------------------------------------------------------------------ запуск скана
@@ -82,29 +151,45 @@ def start_scan():
     if not site.startswith(("http://", "https://")):
         site = "https://" + site
     job_id = uuid.uuid4().hex[:8]
-    JOBS[job_id] = {"site": site, "status": "running", "result": None}
+    try:
+        max_pages = int(request.form.get("max_pages", 1000))
+    except (TypeError, ValueError):
+        max_pages = 1000
+    JOBS[job_id] = {"site": site, "status": "running", "result": None,
+                    "started_at": time.time(),
+                    "started_dt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "finished_at": 0, "finished_dt": "",
+                    "scan_id": None, "index": None}
 
     def worker():
         try:
-            res = run_scan(site, store=store, max_pages=int(request.form.get("max_pages", 1000)))
-            JOBS[job_id].update(status="done", result=res.notes[-1] if res.notes else "ok",
+            res = run_scan(site, store=store, max_pages=max_pages)
+            JOBS[job_id].update(status="completed",
+                                result=res.notes[-1] if res.notes else "ok",
                                 scan_id=_last_scan_id(site), index=res.compliance_index)
         except Exception as e:
-            JOBS[job_id].update(status="error", result=str(e))
+            JOBS[job_id].update(status="failed", result=str(e))
+        finally:
+            # фиксируем время окончания и сразу чистим «старьё» (ТЗ §5 логирование/память)
+            JOBS[job_id]["finished_at"] = time.time()
+            JOBS[job_id]["finished_dt"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cleanup_old_jobs()
 
     threading.Thread(target=worker, daemon=True).start()
     return redirect(url_for("dashboard"))
 
 
 def _last_scan_id(site: str) -> int | None:
-    rows = [s for s in store.list_scans(site) ]
+    rows = [s for s in store.list_scans(site)]
     return rows[0]["id"] if rows else None
 
 
 @app.route("/api/jobs")
 @login_required
 def api_jobs():
-    return jsonify(JOBS)
+    """Статусы АКТИВНЫХ задач — для AJAX-опроса на дашборде без перезагрузки."""
+    cleanup_old_jobs()
+    return jsonify(_active_jobs())
 
 
 # ------------------------------------------------------------------ история/детализация

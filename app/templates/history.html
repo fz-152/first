@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}История сканирований — Сканер соответствия сайтов ОО{% endblock %}
+{% block content %}
+<h1>История сканирований (завершённые задачи)</h1>
+
+<div class="card">
+  <p class="muted">Здесь показываются завершённые задачи текущего процесса (статусы
+    completed / failed). Постоянная история всех сканов с индексами соответствия и
+    динамикой — на <a href="{{ url_for('dashboard') }}">Дашборде</a>.
+    Задачи автоматически удаляются из памяти через 24 часа после завершения.</p>
+</div>
+
+<div class="card">
+  <h2>Завершённые задачи реестра JOBS</h2>
+  {% if jobs %}
+  <table>
+    <thead>
+      <tr>
+        <th>Дата окончания</th>
+        <th>URL сайта</th>
+        <th>Статус</th>
+        <th>Индекс соответствия, %</th>
+        <th>Отчёт</th>
+        {% if current_user().role == 'admin' %}<th></th>{% endif %}
+      </tr>
+    </thead>
+    <tbody>
+    {% for jid, j in jobs %}
+      <tr>
+        <td>{{ j.finished_dt or j.finished_at }}</td>
+        <td>{{ j.site }}</td>
+        <td>
+          {% if j.status == 'completed' %}<span class="badge b-green">completed</span>
+          {% else %}<span class="badge b-red">failed</span>{% endif %}
+        </td>
+        <td>
+          {% if j.index is not none %}
+            <span style="color:var(--{{ 'red' if traffic_light(j.index)=='red' else ('yellow' if traffic_light(j.index)=='yellow' else 'green') }});font-weight:700">
+              {{ j.index }}%</span>
+          {% else %}—{% endif %}
+        </td>
+        <td>
+          {% if j.scan_id %}
+            <a class="btn small" href="{{ url_for('scan_detail', scan_id=j.scan_id) }}">Просмотр отчёта</a>
+          {% else %}
+            <span class="muted">{{ j.result or 'отчёт недоступен' }}</span>
+          {% endif %}
+        </td>
+        {% if current_user().role == 'admin' %}
+        <td>
+          <form method="post" action="{{ url_for('history_clear') }}" style="margin:0"
+                onsubmit="return confirm('Удалить ВСЕ завершённые задачи из памяти?');"
+                title="Очистить все завершённые задачи (старше 24 ч удаляются автоматически)">
+            <button class="btn small" type="submit" style="background:#8a93a5">Очистить завершённые</button>
+          </form>
+        </td>
+        {% endif %}
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p>Завершённых задач нет. Активные сканирования видны на
+    <a href="{{ url_for('dashboard') }}">Дашборде</a>.</p>
+  {% endif %}
+</div>
+
+<a class="btn" href="{{ url_for('dashboard') }}">← Вернуться на Дашборд</a>
+{% endblock %}
