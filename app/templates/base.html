@@ -43,7 +43,8 @@ footer{text-align:center;color:#8a93a5;font-size:12px;margin:30px 0 12px}
   {% if current_user() %}
   <nav>
     <a href="{{ url_for('dashboard') }}">Дашборд</a>
-    {% if current_user().role in ('admin','auditor') %}<a href="#scanform">Сканирование</a>{% endif %}
+    <a href="{{ url_for('history') }}">История</a>
+    {% if current_user().role in ('admin','auditor') %}<a href="{{ url_for('dashboard') }}#scanform">Сканирование</a>{% endif %}
     {% if current_user().role == 'admin' %}<a href="{{ url_for('admin_rules') }}">Чек-листы</a>
     <a href="{{ url_for('admin_users') }}">Пользователи</a>{% endif %}
   </nav>
