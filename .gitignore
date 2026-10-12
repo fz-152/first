@@ -1,5 +1,1 @@
-__pycache__/
-*.pyc
-.env
-data/secret_key
-data/*.db
+*.log

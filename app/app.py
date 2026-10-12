@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import queue
 import threading
 import time
 import uuid
@@ -13,9 +15,10 @@ from datetime import datetime
 from pathlib import Path
 
 from flask import (Flask, render_template, request, redirect, url_for, session,
-                   flash, abort, send_file, jsonify)
+                   flash, abort, send_file, jsonify, Response)
 
-from scanner.engine import run_scan, traffic_light
+from scanner.engine import (run_scan, traffic_light, make_progress_handler,
+                            _ProgressFilter)
 from scanner.models import Store, DB_PATH
 from scanner.checklists import ALL_BLOCKS, RULES_BY_ID, CRITICAL, MAJOR, MINOR
 from scanner import reports as report_mod
@@ -41,6 +44,97 @@ JOBS: dict[str, dict] = {}
 
 # время хранения завершённых задач в JOBS (НФТ: очистка от «мусора» памяти)
 JOB_RETENTION_SEC = 86400  # 24 часа
+
+# --------------------------------------------------------------- SSE-лог сканера
+# Потокобезопасное хранилище очередей сообщений: job_id -> queue.Queue.
+# Ограниченная очередь (maxsize) не даёт памяти расти при долгих сканах:
+# если ни один клиент не подключён, старые сообщения вытесняются новыми.
+SCAN_LOGS: dict[str, queue.Queue] = {}
+SCAN_LOGS_LOCK = threading.Lock()
+SCAN_LOG_MAXSIZE = 500          # размер очереди на задачу
+SCAN_LOG_GC_SEC = 15 * 60       # TTL: принудительно чистить незакрытые очереди через 15 мин
+
+
+def _get_queue(job_id: str) -> queue.Queue:
+    """Возвращает (создавая при необходимости) очередь логов задачи."""
+    with SCAN_LOGS_LOCK:
+        q = SCAN_LOGS.get(job_id)
+        if q is None:
+            q = SCAN_LOGS[job_id] = queue.Queue(maxsize=SCAN_LOG_MAXSIZE)
+        return q
+
+
+def _push_event(job_id: str, etype: str, **data):
+    """Кладёт типизированное сообщение {"type": ..., "data": {...}} в очередь.
+
+    Никогда не блокирует worker: если очередь полна, выбрасываем самое старое
+    сообщение и повторяем попытку (сканирование важнее полного лога).
+    """
+    msg = json.dumps({"type": etype, "ts": datetime.now().strftime("%H:%M:%S"),
+                      "data": data}, ensure_ascii=False)
+    q = _get_queue(job_id)
+    while True:
+        try:
+            q.put_nowait(msg)
+            return
+        except queue.Full:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                pass
+
+
+class _QueueLogHandler(logging.Handler):
+    """Мост engine.emit → SSE: каждое событие прогресса сканера (scan_event)
+    превращается в сообщение типа info/pass/warning/error.
+
+    ВАЖНО: не наследует фильтр _ProgressFilter от logging.Filter — у того метод
+    называется ``filter()``, а Handler вызывает ``filter()`` как предикат, что
+    приводит к бесконечной рекурсии и молчаливой потере всех событий. Здесь
+    проверка атрибута scan_event выполняется напрямую.
+    """
+    _ICON_TYPES = {"ℹ": "info", "✓": "pass", "⚠": "warning", "✗": "error"}
+
+    def __init__(self, job_id: str):
+        super().__init__()
+        self.job_id = job_id
+
+    def handle(self, record: logging.LogRecord):
+        if not hasattr(record, "scan_event"):   # только события прогресса скана
+            return
+        self.emit(record)
+
+    def emit(self, record: logging.LogRecord):
+        try:
+            icon = getattr(record, "icon", "ℹ")
+            etype = self._ICON_TYPES.get(icon, "info")
+            _push_event(self.job_id, etype, message=record.getMessage(), icon=icon)
+        except Exception:
+            self.handleError(record)   # UI-лог не должен ронять сканирование
+
+
+def cleanup_scan_logs():
+    """GC для SCAN_LOGS: удаляет «осиротевшие» очереди — задача завершена,
+    но терминатор не был прочитан клиентом (клиент отключился / не подключался),
+    либо истёк TTL. Вызывается из потоков-раздатчиков SSE и по finish-сигналу."""
+    now = time.time()
+    with SCAN_LOGS_LOCK:
+        stale = []
+        for jid in list(SCAN_LOGS):
+            job = JOBS.get(jid)
+            status = (job or {}).get("status")
+            started_at = (job or {}).get("started_at", 0)
+            finished_at = (job or {}).get("finished_at", 0)
+            done = status in ("completed", "failed")
+            # очередь-терминатор отправлена, но 5 минут никто не читал → GC
+            orphaned = done and finished_at and now - finished_at > 5 * 60
+            # страховка от «вечных» очередей задач, удалённых из JOBS, или зависших
+            ttl_expired = (not started_at) or (now - started_at > SCAN_LOG_GC_SEC * 4)
+            if orphaned or (job is None and ttl_expired) or (done and ttl_expired):
+                stale.append(jid)
+        for jid in stale:
+            SCAN_LOGS.pop(jid, None)
+    return stale
 
 
 def cleanup_old_jobs():
@@ -162,17 +256,34 @@ def start_scan():
                     "scan_id": None, "index": None}
 
     def worker():
+        # мост событий прогресса сканера (engine.emit) в SSE-очередь задачи
+        _get_queue(job_id)   # создаём очередь сразу, до появления первых событий
+        qh = _QueueLogHandler(job_id)
+        _push_event(job_id, "info", message=f"Сканирование запущено: {site}", icon="ℹ")
         try:
-            res = run_scan(site, store=store, max_pages=max_pages)
+            res = run_scan(site, store=store, max_pages=max_pages, progress_log=qh)
             JOBS[job_id].update(status="completed",
                                 result=res.notes[-1] if res.notes else "ok",
                                 scan_id=_last_scan_id(site), index=res.compliance_index)
+            # финальное событие с индексом соответствия
+            _push_event(job_id, "done",
+                        message=f"Сканирование завершено. Индекс соответствия: "
+                                f"{res.compliance_index:.1f}%",
+                        icon="✓", index=res.compliance_index,
+                        pages=res.pages_scanned, violations=len(res.violations),
+                        scan_id=JOBS[job_id]["scan_id"])
         except Exception as e:
             JOBS[job_id].update(status="failed", result=str(e))
+            _push_event(job_id, "error",
+                        message=f"Сканирование завершилось ошибкой: {e}", icon="✗")
         finally:
             # фиксируем время окончания и сразу чистим «старьё» (ТЗ §5 логирование/память)
             JOBS[job_id]["finished_at"] = time.time()
             JOBS[job_id]["finished_dt"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            qh.close()
+            # терминатор ОБЯЗАТЕЛЬНО (успех или ошибка): стрим отдаст event: end
+            # и завершится; очередь до читателя удалит GC cleanup_scan_logs()
+            _get_queue(job_id).put(None)
             cleanup_old_jobs()
 
     threading.Thread(target=worker, daemon=True).start()
@@ -184,11 +295,48 @@ def _last_scan_id(site: str) -> int | None:
     return rows[0]["id"] if rows else None
 
 
+# --------------------------------------------------------------- SSE-стрим логов
+@app.route("/api/scan/<job_id>/stream")
+@login_required
+def scan_stream(job_id):
+    """Live-трансляция хода сканирования (Server-Sent Events).
+
+    text/event-stream; при простое — SSE-комментарий ping (разрывает таймауты
+    обратных прокси, напр. Nginx, не закрывая соединение); по терминатору None
+    — финальное событие `end` и корректное завершение генератора.
+    """
+    if job_id not in JOBS:
+        abort(404)
+    q = _get_queue(job_id)
+
+    def gen():
+        yield "retry: 3000\n\n"           # автопереподключение клиента через 3 c
+        while True:
+            try:
+                msg = q.get(timeout=15)   # ждём не дольше таймаута типичного прокси
+            except queue.Empty:
+                yield ": ping\n\n"        # служебный комментарий SSE
+                continue
+            if msg is None:               # сигнал завершения от worker'а
+                yield 'event: end\ndata: {"type": "end"}\n\n'
+                break
+            yield f"data: {msg}\n\n"
+        # поток дочитан до конца — очередь больше не нужна (антиутечка памяти)
+        with SCAN_LOGS_LOCK:
+            SCAN_LOGS.pop(job_id, None)
+
+    return Response(gen(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache",
+                             "X-Accel-Buffering": "no",   # Nginx: не буферизовать ответ
+                             "Connection": "keep-alive"})
+
+
 @app.route("/api/jobs")
 @login_required
 def api_jobs():
     """Статусы АКТИВНЫХ задач — для AJAX-опроса на дашборде без перезагрузки."""
     cleanup_old_jobs()
+    cleanup_scan_logs()   # GC «осиротевших» SSE-очередей (клиент не дочитал)
     return jsonify(_active_jobs())
 
 
